@@ -29,6 +29,8 @@ import com.sitecam.app.core.watermark.model.WatermarkData
 import com.sitecam.app.core.watermark.model.WatermarkSnapshotCodec
 import com.sitecam.app.core.watermark.model.resolveWatermarkFields
 import com.sitecam.app.core.watermark.renderer.WatermarkBitmapRenderer
+import com.sitecam.app.core.camera.SnapshotPolicy
+import com.sitecam.app.core.camera.captureAndSaveFrames
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
@@ -84,6 +86,8 @@ data class CameraUiState(
     val orientationDegrees: Int = 0,
     val isQuickIssueMode: Boolean = false,
     val isCapturing: Boolean = false,
+    val burstEnabled: Boolean = false,
+    val isBurstCapturing: Boolean = false,
     val latestThumbnailUri: String? = null,
     val latestMediaType: String? = null,
     val captureMode: CaptureMode = CaptureMode.PHOTO,
@@ -131,6 +135,9 @@ class CameraViewModel(
     /** Keeps automatic geocoding from finishing a request during a manual retry. */
     private var manualAddressActive = false
     private val _isCapturing = MutableStateFlow(false)
+    private val _burstEnabled = MutableStateFlow(false)
+    private val _isBurstCapturing = MutableStateFlow(false)
+    private var photoSessionJob: Job? = null
     private val _latestThumbnailUri = MutableStateFlow<String?>(null)
     private val _latestMediaType = MutableStateFlow<String?>(null)
     private val _captureMode = MutableStateFlow(CaptureMode.PHOTO)
@@ -163,6 +170,9 @@ class CameraViewModel(
     private var activeVideoSession: VideoCaptureSession? = null
     private val pendingVideoStore by lazy { PendingVideoStore(appContainer.appContext, appContainer.database.mediaItemDao()) }
     private var recoveryJob: Job? = null
+    private val _weather = MutableStateFlow<com.sitecam.app.core.weather.SystemWeatherReading?>(null)
+    private var weatherJob: Job? = null
+    private val systemWeatherReader = com.sitecam.app.core.weather.SystemWeatherReader(appContainer.appContext)
     private val _clockTick = MutableStateFlow(System.currentTimeMillis())
 
     private data class CaptureLocation(
@@ -221,7 +231,10 @@ class CameraViewModel(
             _recordingDurationSeconds,
             appContainer.settingsDataStore.shutterSoundEnabled,
             _clockTick,
-            appContainer.settingsDataStore.cameraControlStyle
+            appContainer.settingsDataStore.cameraControlStyle,
+            _burstEnabled,
+            _isBurstCapturing,
+            _weather
         ) as List<Flow<Any?>>
     ) { array ->
         val project = array[0] as? ProjectEntity
@@ -271,6 +284,7 @@ class CameraViewModel(
             locationStatus = locationStatus,
             addressText = watermarkAddress,
             userName = resolvedFields.userName,
+            weatherText = (array[23] as? com.sitecam.app.core.weather.SystemWeatherReading)?.takeIf { it.matches(location, clockTick) }?.text.orEmpty(),
             enabledSystemFields = resolvedFields.enabledSystemFields,
             systemValueOverrides = resolvedFields.systemValueOverrides,
             customFields = resolvedFields.customFields,
@@ -306,7 +320,9 @@ class CameraViewModel(
             isRecordingVideo = isRecording,
             recordingDurationSeconds = duration,
             shutterSoundEnabled = shutterSoundEnabled,
-            cameraControlStyle = (array[20] as? String) ?: "NORMAL"
+            cameraControlStyle = (array[20] as? String) ?: "NORMAL",
+            burstEnabled = array[21] as? Boolean ?: false,
+            isBurstCapturing = array[22] as? Boolean ?: false
         )
     }.stateIn(
         scope = viewModelScope,
@@ -316,6 +332,14 @@ class CameraViewModel(
 
     init {
         cameraManager.setZoomCaptureMode(_captureMode.value == CaptureMode.VIDEO)
+        viewModelScope.launch {
+            combine(appContainer.settingsDataStore.snapshotEnabled,
+                appContainer.settingsDataStore.snapshotShutterSpeed, _burstEnabled, _captureMode) { enabled, speed, burst, mode ->
+                Triple(SnapshotPolicy.enabled(enabled, burst) && mode == CaptureMode.PHOTO, speed, mode)
+            }.collect { (enabled, speed, _) ->
+                if (!_isCapturing.value) cameraManager.configureSnapshot(enabled, speed)
+            }
+        }
         loadInitialData()
         recoverPendingVideos()
         viewModelScope.launch {
@@ -559,6 +583,12 @@ class CameraViewModel(
         if (locationEnabled) appContainer.locationTracker.startLocationUpdates()
         else appContainer.locationTracker.stopLocationUpdates()
         orientationManager.startListening()
+        if (weatherJob?.isActive != true) weatherJob = viewModelScope.launch {
+            while (isActive) {
+                _weather.value = systemWeatherReader.read()
+                delay(120_000L)
+            }
+        }
     }
 
     fun updateLocationPermission(granted: Boolean) {
@@ -567,6 +597,9 @@ class CameraViewModel(
     }
 
     fun stopForegroundServices() {
+        stopBurst()
+        weatherJob?.cancel()
+        weatherJob = null
         appContainer.locationTracker.stopLocationUpdates()
         orientationManager.stopListening()
     }
@@ -798,7 +831,15 @@ class CameraViewModel(
         )
     }
 
+    fun toggleBurstMode() {
+        if (_isCapturing.value || _captureMode.value != CaptureMode.PHOTO) return
+        _burstEnabled.value = !_burstEnabled.value
+    }
+
+    fun stopBurst() { _isBurstCapturing.value = false }
+
     fun handleShutterAction(context: Context, withAudio: Boolean = false) {
+        if (_isBurstCapturing.value) { stopBurst(); return }
         if (_isProjectSwitching.value) {
             viewModelScope.launch { _uiEvents.emit(CameraUiEvent.ShowToast("工程切换中，请稍候")) }
             return
@@ -1067,62 +1108,88 @@ class CameraViewModel(
         }
     }
 
+    private data class PhotoFrame(val bitmap: Bitmap, val rotation: Int, val surfaceRotation: Int,
+        val timestamp: Long, val location: CaptureLocation, val watermark: WatermarkData, val mirrored: Boolean)
+
     fun capturePhoto() {
         if (_isProjectSwitching.value || _isCapturing.value || cameraManager.videoRecordingState.value != CameraManager.VideoRecordingState.IDLE) return
-
-        val currentState = uiState.value
-        val project = currentState.currentProject
+        val state = uiState.value
+        val project = state.currentProject
         if (project == null) {
             viewModelScope.launch { _uiEvents.emit(CameraUiEvent.ShowToast("请先选择工程包")) }
             return
         }
-        val quickIssueModeAtCapture = _quickIssueMode.value
-
-        val captureTimestamp = System.currentTimeMillis()
-        val captureLocation = freshLocation(currentState, captureTimestamp)
-        val watermarkData = currentState.watermarkData.copy(
-            captureTimestamp = captureTimestamp,
-            captureTimeZoneId = java.util.TimeZone.getDefault().id,
-            latitude = captureLocation.latitude,
-            longitude = captureLocation.longitude,
-            altitude = captureLocation.altitude,
-            addressText = captureLocation.address,
-            locationStatus = captureLocation.status
-        )
-
+        val burst = _burstEnabled.value
+        val quickIssue = _quickIssueMode.value
         _isCapturing.value = true
-
-        viewModelScope.launch(appContainer.dispatchers.io) {
+        _isBurstCapturing.value = burst
+        photoSessionJob = viewModelScope.launch(appContainer.dispatchers.io) {
             var reserved = false
-            var rawBitmap: Bitmap? = null
-            var watermarkedBitmap: Bitmap? = null
+            var saved = 0
+            var lastSaved: Pair<Long, Uri>? = null
             try {
                 reserved = appContainer.captureOperationCoordinator.tryBegin(project.id) {
                     appContainer.database.projectDao().getProjectById(project.id)?.let { !it.isCaptureLocked && !it.isArchived } == true
                 }
                 check(reserved) { "此工程已锁定或正在拍摄，请解锁或切换工程" }
-                val profile = appContainer.settingsDataStore.photoQualityProfile.first()
-                val saveToGallery = appContainer.settingsDataStore.saveToSystemGallery.first()
-                // CameraScreen keeps CameraX aligned with the actual window;
-                // reuse that target for the still capture and rendered aspect
-                // ratio so an excluded 180-degree sensor reading cannot make
-                // the saved image disagree with the preview.
-                val surfaceRotation = cameraManager.currentTargetRotation()
-                val captured = cameraManager.capturePhoto(surfaceRotation)
-                val capturedBitmap = captured.first
-                rawBitmap = capturedBitmap
-                val rotationDegrees = captured.second
+                val quick = SnapshotPolicy.enabled(appContainer.settingsDataStore.snapshotEnabled.first(), burst)
+                cameraManager.configureSnapshot(quick, appContainer.settingsDataStore.snapshotShutterSpeed.first())
+                val profile = SnapshotPolicy.profile(quick, appContainer.settingsDataStore.photoQualityProfile.first())
+                val gallery = appContainer.settingsDataStore.saveToSystemGallery.first()
+                val pattern = appContainer.settingsDataStore.namingPattern.first()
+                saved = captureAndSaveFrames(
+                    multiple = burst,
+                    shouldCapture = { (!burst || _isBurstCapturing.value) && cameraManager.isCameraReady.value },
+                    capture = {
+                        val timestamp = System.currentTimeMillis()
+                        val current = uiState.value
+                        val location = freshLocation(current, timestamp)
+                        val watermark = current.watermarkData.copy(captureTimestamp = timestamp,
+                            captureTimeZoneId = java.util.TimeZone.getDefault().id,
+                            latitude = location.latitude, longitude = location.longitude,
+                            altitude = location.altitude, addressText = location.address, locationStatus = location.status)
+                        val rotation = cameraManager.currentTargetRotation()
+                        val capture = cameraManager.capturePhoto(rotation)
+                        PhotoFrame(capture.first, capture.second, rotation, timestamp, location, watermark, cameraManager.previewIsMirrored())
+                    },
+                    save = { frame -> lastSaved = savePhotoFrame(frame, project, profile, gallery, pattern, quickIssue, burst) },
+                    discard = { frame -> if (!frame.bitmap.isRecycled) frame.bitmap.recycle() }
+                )
+                if (burst && saved > 0) _uiEvents.emit(CameraUiEvent.ShowToast("连拍已保存 $saved 张"))
+                if (quickIssue && lastSaved != null) _uiEvents.emit(CameraUiEvent.QuickIssuePrompt(lastSaved!!.first, lastSaved!!.second))
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (outOfMemory: OutOfMemoryError) { _uiEvents.emit(CameraUiEvent.ShowToast("内存不足，已停止拍摄")) }
+            catch (error: Exception) { _uiEvents.emit(CameraUiEvent.ShowToast("拍摄失败: ${error.message ?: "未知错误"}")) }
+            finally {
+                _isBurstCapturing.value = false
+                if (reserved) appContainer.captureOperationCoordinator.finish(project.id)
+                _isCapturing.value = false
+            }
+        }
+    }
 
+    private suspend fun savePhotoFrame(frame: PhotoFrame, project: ProjectEntity,
+        profile: com.sitecam.app.core.media.PhotoQualityProfile, saveToGallery: Boolean,
+        namingPattern: String, quickIssueModeAtCapture: Boolean, burst: Boolean): Pair<Long, Uri> {
+        val capturedBitmap = frame.bitmap
+        val rotationDegrees = frame.rotation
+        val surfaceRotation = frame.surfaceRotation
+        val captureTimestamp = frame.timestamp
+        val captureLocation = frame.location
+        val watermarkData = frame.watermark
+        var watermarkedBitmap: Bitmap? = null
+        try {
                 val renderedBitmap = WatermarkBitmapRenderer.renderWatermarkOnBitmap(
                     sourceBitmap = capturedBitmap,
                     watermarkData = watermarkData,
                     rotationDegrees = rotationDegrees,
                     targetAspectRatio = if (surfaceRotation == android.view.Surface.ROTATION_90 || surfaceRotation == android.view.Surface.ROTATION_270) 4f / 3f else 3f / 4f,
-                    qualityProfile = profile
+                    qualityProfile = profile,
+                    mirrorHorizontally = frame.mirrored
                 )
                 watermarkedBitmap = renderedBitmap
 
-                val pattern = appContainer.settingsDataStore.namingPattern.first()
+                val pattern = namingPattern
                 val fileName = NamingEngine.generateFileName(
                     projectName = project.name,
                     categoryName = project.categoryName,
@@ -1181,35 +1248,20 @@ class CameraViewModel(
                     CameraUiEvent.PhotoSaved(
                         mediaId = mediaId,
                         uri = saveResult.uri,
-                        showToast = !quickIssueModeAtCapture
+                        showToast = !quickIssueModeAtCapture && !burst
                     )
                 )
 
-                if (quickIssueModeAtCapture) {
-                    _uiEvents.emit(CameraUiEvent.QuickIssuePrompt(mediaId, saveResult.uri))
-                }
-            } catch (cancelled: CancellationException) {
-                // A cancelled capture is not a business failure; the finally
-                // below still releases the reservation and resets the UI state.
-                throw cancelled
-            } catch (outOfMemory: OutOfMemoryError) {
-                // A full-resolution frame plus its watermarked copies can exceed
-                // the heap; report it instead of taking the process down.
-                _uiEvents.emit(CameraUiEvent.ShowToast("内存不足，拍摄失败，请重试"))
-            } catch (e: Exception) {
-                _uiEvents.emit(CameraUiEvent.ShowToast("拍摄失败: ${e.message ?: "未知错误"}"))
-            } finally {
-                if (reserved) appContainer.captureOperationCoordinator.finish(project.id)
-                watermarkedBitmap?.takeIf { !it.isRecycled }?.recycle()
-                if (rawBitmap != watermarkedBitmap) {
-                    rawBitmap?.takeIf { !it.isRecycled }?.recycle()
-                }
-                _isCapturing.value = false
-            }
+                return mediaId to saveResult.uri
+
+        } finally {
+            watermarkedBitmap?.takeIf { !it.isRecycled }?.recycle()
+            if (capturedBitmap != watermarkedBitmap && !capturedBitmap.isRecycled) capturedBitmap.recycle()
         }
     }
 
     override fun onCleared() {
+        stopBurst()
         super.onCleared()
         activeVideoSession?.let { session ->
             kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch { appContainer.captureOperationCoordinator.finish(session.project.id) }
