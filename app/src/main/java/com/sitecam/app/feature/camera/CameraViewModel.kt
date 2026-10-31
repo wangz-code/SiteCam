@@ -961,7 +961,7 @@ class CameraViewModel(
                     _isRecordingVideo.value = false
                     recordingTimerJob?.cancel()
                     if (mayRetainRecordedFrames(event.error) && session.tempFile.length() > 0L) {
-                        _isCapturing.value = true
+                        _isCapturing.value = false
                         viewModelScope.launch {
                             _uiEvents.emit(CameraUiEvent.ShowToast("录像已结束，正在烧录工程水印…"))
                         }
@@ -1131,7 +1131,9 @@ class CameraViewModel(
                 reserved = appContainer.captureOperationCoordinator.tryBegin(project.id) {
                     appContainer.database.projectDao().getProjectById(project.id)?.let { !it.isCaptureLocked && !it.isArchived } == true
                 }
-                check(reserved) { "此工程已锁定或正在拍摄，请解锁或切换工程" }
+                viewModelScope.launch { _uiEvents.emit(CameraUiEvent.ShowToast("der 开始拍照=>异步->by全")) }
+
+//                check(reserved) { "der此工程已锁定或正在拍摄，请解锁或切换工程" }
                 val quick = SnapshotPolicy.enabled(appContainer.settingsDataStore.snapshotEnabled.first(), burst)
                 cameraManager.configureSnapshot(quick, appContainer.settingsDataStore.snapshotShutterSpeed.first())
                 val profile = SnapshotPolicy.profile(quick, appContainer.settingsDataStore.photoQualityProfile.first())
